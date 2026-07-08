@@ -1,0 +1,152 @@
+# -*- coding: utf-8 -*-
+"""
+Telco Customer Churn - Data Cleaning
+
+Cleaning up the raw churn data before doing any EDA on it.
+Input: Telco_customer_churn.xlsx
+Output: cleaned_churn.csv
+"""
+
+import pandas as pd
+import numpy as np
+
+pd.set_option('display.max_columns', None)
+
+df = pd.read_excel('Telco_customer_churn.xlsx')
+
+print(df.shape)
+print(df.head())
+print(df.info())
+print(df.describe(include='all').T)
+
+# quick structural checks first
+print("duplicate rows:", df.duplicated().sum())
+print("duplicate customer ids:", df['CustomerID'].duplicated().sum())
+print(df.isnull().sum()[df.isnull().sum() > 0])
+
+# look through the categorical columns to see if anything looks off
+cat_cols = df.select_dtypes(include=['object']).columns.tolist()
+print(cat_cols)
+
+for col in cat_cols:
+    if df[col].nunique() <= 15:
+        print(col, df[col].nunique(), df[col].unique())
+    else:
+        print(col, df[col].nunique(), '- too many to print')
+
+# there could be blank strings hiding as non-null, replace those with NaN
+df.replace({r'^\s*$': np.nan}, regex=True, inplace=True)
+
+# Country and State only have one value each in this dataset, so they're
+# basically useless for analysis - dropping them later
+for col in cat_cols:
+    if df[col].nunique() == 1:
+        print(col, 'only has one value:', df[col].unique()[0])
+
+# Total Charges is stored as text, need to convert it to numbers
+df['Total Charges'] = pd.to_numeric(df['Total Charges'], errors='coerce')
+print("total charges missing after conversion:", df['Total Charges'].isnull().sum())
+
+# check why these are missing before just filling them in
+print(df[df['Total Charges'].isnull()][['Tenure Months', 'Monthly Charges', 'Total Charges', 'Churn Label']])
+
+# turns out all of these are customers with 0 months tenure, meaning they
+# haven't actually been billed yet. so instead of filling with the median
+# (which would make it look like they've been charged something) I'm
+# just setting these to 0
+zero_tenure_missing = df['Total Charges'].isnull() & (df['Tenure Months'] == 0)
+print(zero_tenure_missing.sum(), "of the missing rows have 0 tenure")
+df.loc[zero_tenure_missing, 'Total Charges'] = 0
+
+# just in case anything is still missing for some other reason, fall back
+# to median since the column is right skewed
+if df['Total Charges'].isnull().sum() > 0:
+    median_val = df['Total Charges'].median()
+    df['Total Charges'] = df['Total Charges'].fillna(median_val)
+    print("filled remaining missing values with median:", median_val)
+
+# sanity check, Total Charges should usually be >= Monthly Charges once
+# someone has some tenure. not fixing these, just noting it
+odd_charges = df[(df['Tenure Months'] > 0) & (df['Total Charges'] < df['Monthly Charges'])]
+print("rows where total charges is less than monthly charges:", len(odd_charges))
+
+# Churn Reason is blank for people who didn't churn, which makes sense.
+# filling with something more descriptive than NaN
+print("churn reason missing:", df['Churn Reason'].isnull().sum())
+check = df[(df['Churn Reason'].isnull()) & (df['Churn Label'] == 'Yes')]
+print("churned customers with no reason listed (should be 0):", len(check))
+df['Churn Reason'] = df['Churn Reason'].fillna('Not Applicable')
+
+print(df.isnull().sum()[df.isnull().sum() > 0])
+
+# double checking a few columns agree with each other the way they should
+mismatch = df[
+    ((df['Churn Label'] == 'Yes') & (df['Churn Value'] != 1)) |
+    ((df['Churn Label'] == 'No') & (df['Churn Value'] != 0))
+]
+print("churn label / churn value mismatches:", len(mismatch))
+
+# columns like Online Security, Tech Support etc should say "No internet
+# service" when someone doesn't have internet at all
+dependent_cols = ['Online Security', 'Online Backup', 'Device Protection',
+                   'Tech Support', 'Streaming TV', 'Streaming Movies']
+for col in dependent_cols:
+    bad = df[(df['Internet Service'] == 'No') & (df[col] != 'No internet service')]
+    print(col, 'mismatches:', len(bad))
+
+bad_phone = df[(df['Phone Service'] == 'No') & (df['Multiple Lines'] != 'No phone service')]
+print('multiple lines mismatches:', len(bad_phone))
+
+# quick outlier check on the numeric columns using IQR
+numeric_cols = ['Tenure Months', 'Monthly Charges', 'Total Charges', 'Churn Score', 'CLTV']
+for col in numeric_cols:
+    q1 = df[col].quantile(0.25)
+    q3 = df[col].quantile(0.75)
+    iqr = q3 - q1
+    low = q1 - 1.5 * iqr
+    high = q3 + 1.5 * iqr
+    outliers = ((df[col] < low) | (df[col] > high)).sum()
+    print(col, 'outliers:', outliers)
+# nothing extreme showed up, all values look like normal business ranges
+
+# dropping columns that don't add anything for this analysis
+# CustomerID - just an id
+# Count - always 1
+# Country / State - only one value each
+# Zip Code, Lat Long, Latitude, Longitude - geo detail not needed here
+df.drop(columns=['CustomerID', 'Count', 'Country', 'State', 'Zip Code',
+                  'Lat Long', 'Latitude', 'Longitude'], inplace=True)
+
+# bucket churn score into something more readable
+def score_bucket(x):
+    if x > 80:
+        return 'High'
+    elif x > 50:
+        return 'Moderate'
+    else:
+        return 'Low'
+
+df['Churn Category'] = df['Churn Score'].apply(score_bucket)
+print(df['Churn Category'].value_counts())
+
+# also bucket tenure into rough lifecycle stages, might be useful for EDA
+def tenure_bucket(x):
+    if x <= 12:
+        return '0-1 yr'
+    elif x <= 24:
+        return '1-2 yrs'
+    elif x <= 48:
+        return '2-4 yrs'
+    else:
+        return '4+ yrs'
+
+df['Tenure Group'] = df['Tenure Months'].apply(tenure_bucket)
+print(df['Tenure Group'].value_counts())
+
+# final check before saving
+print(df.shape)
+print(df.isnull().sum().sum(), "nulls left")
+print(df.duplicated().sum(), "duplicates left")
+
+df.to_csv('cleaned_churn.csv', index=False)
+print("saved cleaned_churn.csv")
